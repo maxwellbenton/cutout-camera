@@ -1,0 +1,94 @@
+# Extra object names merged into vocab.txt (one per line). These are tried
+# first, so if a name here duplicates a dataset class, this wording wins.
+
+# people (one generic label instead of man/woman/boy/girl)
+person
+
+# yard & landscape
+tree
+tree trunk
+tree stump
+evergreen tree
+shrub
+hedge
+grass
+lawn
+sky
+cloud
+ground
+soil
+mulch
+gravel
+rock
+stone wall
+fence
+gate
+path
+patio
+deck
+shed
+greenhouse
+raised bed
+garden bed
+flower bed
+compost bin
+wheelbarrow
+garden hose
+watering can
+rain barrel
+trellis
+bird feeder
+birdhouse
+mailbox
+woodpile
+pond
+
+# plants
+plant
+potted plant
+seedling
+vine
+leaf
+branch
+flower
+sunflower
+rose
+tulip
+daisy
+lily
+fern
+moss
+mushroom
+vegetable plant
+tomato plant
+pepper plant
+squash plant
+corn plant
+herb
+fruit tree
+apple tree
+berry bush
+
+# things with text on them
+sign
+label
+price tag
+book
+document
+paper
+poster
+receipt
+envelope
+letter
+menu
+newspaper
+magazine
+whiteboard
+screen
+package
+box
+can
+jar
+bottle
+seed packet
+license plate
