@@ -4,11 +4,17 @@
 //   tree-1.png, tree-2.png   several trees, numbered left → right
 //   sign-stop.png            a little text on the object goes into the name
 //   book-1.png + book-1.txt  a lot of text gets its own .txt next to the PNG
+//   packet-kerrygold.png     …and if one line is clearly the headline (much
+//     + .txt                 taller than the rest, ≤ 3 words), it names the file
 
 export const TEXT_RULES = {
   /** Text at or under both limits is short enough to put in the filename. */
   nameMaxWords: 5,
   nameMaxChars: 40,
+  /** A headline must be this much taller than the median line… */
+  headlineHeightRatio: 1.5,
+  /** …and this short. */
+  headlineMaxWords: 3,
   /** Max length of the whole base filename. */
   maxBaseLength: 60,
 };
@@ -18,7 +24,7 @@ export type TextLine = { text: string; score: number; box: { x: number; y: numbe
 export type TextSummary =
   | { kind: "none" }
   | { kind: "short"; text: string }
-  | { kind: "long"; text: string };
+  | { kind: "long"; text: string; headline?: string };
 
 export function slug(s: string, max = 40): string {
   return s
@@ -58,7 +64,21 @@ export function summarizeText(lines: TextLine[]): TextSummary {
   if (words <= TEXT_RULES.nameMaxWords && joined.length <= TEXT_RULES.nameMaxChars) {
     return { kind: "short", text: joined };
   }
-  return { kind: "long", text: clean.join("\n") };
+  return { kind: "long", text: clean.join("\n"), headline: headline(lines) };
+}
+
+/** The visually dominant line (brand name, sign title), if there clearly is one. */
+function headline(lines: TextLine[]): string | undefined {
+  const usable = lines.filter((l) => /[\p{L}]{3,}/u.test(l.text));
+  if (usable.length < 2) return undefined;
+  const heights = usable.map((l) => l.box.h).sort((a, b) => a - b);
+  const median = heights[Math.floor(heights.length / 2)];
+  const top = usable.reduce((a, b) => (b.box.h > a.box.h ? b : a));
+  const words = top.text.trim().split(/\s+/).length;
+  if (top.box.h >= median * TEXT_RULES.headlineHeightRatio && words <= TEXT_RULES.headlineMaxWords) {
+    return top.text.trim();
+  }
+  return undefined;
 }
 
 export type Nameable = {
@@ -71,7 +91,8 @@ export type Nameable = {
 export function assignNames(items: Nameable[]): string[] {
   const bases = items.map((it) => {
     const label = slug(it.label) || "object";
-    const textPart = it.text.kind === "short" ? slug(it.text.text, 32) : "";
+    const textPart =
+      it.text.kind === "short" ? slug(it.text.text, 32) : it.text.kind === "long" && it.text.headline ? slug(it.text.headline, 32) : "";
     const base = textPart && !label.includes(textPart) ? `${label}-${textPart}` : label;
     return base.slice(0, TEXT_RULES.maxBaseLength).replace(/-+$/g, "");
   });

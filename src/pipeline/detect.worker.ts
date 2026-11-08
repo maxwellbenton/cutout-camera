@@ -1,7 +1,9 @@
 /// <reference lib="webworker" />
-// Runs the detector off the main thread: model load, inference, alpha mattes
-// and PNG encoding all happen here.
-import * as ort from "onnxruntime-web/webgpu";
+// Everything heavy happens here, off the UI thread:
+//   1. load the detector (YOLOE-26 seg, ONNX) — WebGPU if available, else WASM
+//   2. detect + build alpha mattes + encode one transparent PNG per object
+//   3. read text on each object (PP-OCRv5) and stream results back
+import * as ort from "onnxruntime-web";
 import {
   buildAlpha,
   decodeDetections,
@@ -12,6 +14,8 @@ import {
   type Letterbox,
   type MaskedDetection,
 } from "./detector.ts";
+import { loadOcr, readText, MIN_CROP_SIDE } from "./ocr.ts";
+import type { TextLine } from "./naming.ts";
 import type { WorkerRequest, WorkerResponse, CutoutResult } from "./messages.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -20,34 +24,40 @@ declare const self: DedicatedWorkerGlobalScope;
 const MAX_SIDE = 3072;
 const PREVIEW_SIDE = 1280;
 
+let appBase = "";
 let session: ort.InferenceSession | null = null;
 let labels: string[] = [];
 let inputSize = 640;
 let backend = "";
+let run = 0;
 
-// Kept from the last run so threshold changes don't need a new inference.
+// Kept from the last inference so threshold changes don't need a new one.
 let last: {
   src: ImageData;
   lb: Letterbox;
   out: { data: Float32Array; dims: readonly number[] };
   protos: { data: Float32Array; dims: readonly number[] };
 } | null = null;
+// OCR results by cutout key, for the current photo.
+const textCache = new Map<string, TextLine[]>();
 
 const post = (msg: WorkerResponse, transfer: Transferable[] = []) => self.postMessage(msg, transfer);
 
 self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
   try {
-    if (msg.type === "init") await init(msg.appBase, msg.modelPath, msg.labelsPath);
-    else if (msg.type === "analyze") await analyze(msg.bitmap, msg.minScore, msg.ignore);
-    else if (msg.type === "redecode") await finish(msg.minScore, msg.ignore);
+    if (msg.type === "init") await init(msg.appBase, msg.modelPath, msg.labelsPath, msg.backend);
+    else if (msg.type === "analyze") await analyze(msg.bitmap, msg.minScore, msg.ignore, msg.ocr);
+    else if (msg.type === "redecode") await finish(++run, msg.minScore, msg.ignore, msg.ocr);
   } catch (err) {
     post({ type: "error", message: err instanceof Error ? err.message : String(err) });
   }
 };
 
-async function init(appBase: string, modelPath: string, labelsPath: string) {
+async function init(base: string, modelPath: string, labelsPath: string, force?: "webgpu" | "wasm") {
   if (session) return post({ type: "ready", backend, classes: labels.length });
+  appBase = base;
+  // Shared by the detector and the OCR library (same onnxruntime-web instance).
   ort.env.wasm.wasmPaths = new URL("ort/", appBase).href;
   ort.env.logLevel = "error";
 
@@ -58,16 +68,13 @@ async function init(appBase: string, modelPath: string, labelsPath: string) {
   labels = names;
 
   const hasGpu = "gpu" in navigator && !!(await (navigator as any).gpu.requestAdapter().catch(() => null));
-  const attempts: string[][] = hasGpu ? [["webgpu"], ["wasm"]] : [["wasm"]];
+  const order = force ? [force] : hasGpu ? ["webgpu", "wasm"] : ["wasm"];
   let lastErr: unknown;
-  for (const providers of attempts) {
+  for (const ep of order) {
     try {
-      post({ type: "status", text: `Starting model (${providers[0]})…` });
-      session = await ort.InferenceSession.create(model, {
-        executionProviders: providers,
-        graphOptimizationLevel: "all",
-      });
-      backend = providers[0];
+      post({ type: "status", text: `Starting model (${ep})…` });
+      session = await ort.InferenceSession.create(model, { executionProviders: [ep], graphOptimizationLevel: "all" });
+      backend = ep;
       break;
     } catch (err) {
       lastErr = err;
@@ -99,8 +106,10 @@ async function fetchWithProgress(url: string): Promise<Uint8Array> {
   return buf;
 }
 
-async function analyze(bitmap: ImageBitmap, minScore: number, ignore: string[]) {
+async function analyze(bitmap: ImageBitmap, minScore: number, ignore: string[], ocr: boolean) {
   if (!session) throw new Error("Model not loaded");
+  const myRun = ++run;
+  textCache.clear();
   const t0 = performance.now();
 
   const s = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
@@ -125,46 +134,78 @@ async function analyze(bitmap: ImageBitmap, minScore: number, ignore: string[]) 
     out: { data: (await out.getData()) as Float32Array, dims: out.dims },
     protos: { data: (await protos.getData()) as Float32Array, dims: protos.dims },
   };
-  post({ type: "status", text: `Inference ${Math.round(performance.now() - t0)} ms — cutting out…` });
-  await finish(minScore, ignore);
+  post({ type: "status", text: `Found objects in ${Math.round(performance.now() - t0)} ms — cutting out…` });
+  await finish(myRun, minScore, ignore, ocr);
 }
 
-async function finish(minScore: number, ignore: string[], keepWholeFrame = false) {
+async function finish(myRun: number, minScore: number, ignore: string[], ocr: boolean) {
   if (!last) return;
   const { src, lb, out, protos } = last;
-  const raw = decodeDetections(out.data, out.dims, lb, src.width, src.height, labels, {
+  const masked = decodeDetections(out.data, out.dims, lb, src.width, src.height, labels, {
     ...defaultDecodeOptions,
     minScore,
     ignore: new Set(ignore),
-  });
-
-  const masked = raw
+  })
     .map((d) => trimToAlpha(buildAlpha(d, protos.data, protos.dims, lb)))
-    // Drop detections whose mask is basically empty — usually a bad box.
-    .filter((d) => d.fill > 0.04)
-    .filter((d) => keepWholeFrame || !isWholeFrame(d, src.width, src.height));
+    .filter((d) => d.fill > 0.04) // empty mask → bad box
+    .filter((d) => !isWholeFrame(d, src.width, src.height)); // "the photo itself"
 
   const cutouts: CutoutResult[] = [];
-  const transfer: Transferable[] = [];
   for (const d of masked) {
-    const png = await cutoutPng(src, d);
-    const crop = await rectCrop(src, d);
     cutouts.push({
+      key: keyOf(d),
       label: d.label,
       classId: d.classId,
       score: d.score,
       box: d.box,
       fill: d.fill,
-      alpha: d.alpha,
-      png,
-      crop,
+      png: await cutoutPng(src, d),
     });
-    transfer.push(d.alpha.buffer);
+  }
+  const preview = await overlay(src, masked);
+  if (myRun !== run) return;
+  post({ type: "result", run: myRun, width: src.width, height: src.height, cutouts, preview });
+
+  if (ocr) await readAll(myRun, src, masked);
+}
+
+async function readAll(myRun: number, src: ImageData, dets: MaskedDetection[]) {
+  const todo = dets.filter((d) => Math.min(d.box.w, d.box.h) >= MIN_CROP_SIDE);
+  for (const d of dets) if (!todo.includes(d)) post({ type: "text", run: myRun, key: keyOf(d), lines: [] });
+  if (!todo.length) return post({ type: "text-done", run: myRun });
+
+  let service;
+  try {
+    post({ type: "status", text: "Loading text reader…" });
+    // The PP-OCR graphs hit unsupported WebGPU kernels; WASM is reliable and quick for crops.
+    service = await loadOcr(appBase, ["wasm"]);
+  } catch (err) {
+    return post({ type: "text-done", run: myRun, error: err instanceof Error ? err.message : String(err) });
   }
 
-  const preview = await overlay(src, masked);
-  post({ type: "result", width: src.width, height: src.height, cutouts, preview }, transfer);
+  // Small objects first: they're quick, and they're where short names come from.
+  todo.sort((a, b) => a.box.w * a.box.h - b.box.w * b.box.h);
+  for (const [i, d] of todo.entries()) {
+    if (myRun !== run) return;
+    const key = keyOf(d);
+    let lines = textCache.get(key);
+    if (!lines) {
+      post({ type: "status", text: `Reading text ${i + 1}/${todo.length}…` });
+      try {
+        const { canvas, offsetX, offsetY } = rectCrop(src, d);
+        lines = await readText(service, canvas, offsetX, offsetY, d.alpha, d.box.w, d.box.h);
+      } catch {
+        lines = []; // one bad crop shouldn't stop the rest
+      }
+      textCache.set(key, lines);
+    }
+    if (myRun !== run) return;
+    post({ type: "text", run: myRun, key, lines });
+  }
+  post({ type: "text-done", run: myRun });
 }
+
+const keyOf = (d: MaskedDetection) => `${d.label}@${d.box.x},${d.box.y},${d.box.w},${d.box.h}`;
 
 /** Source pixels inside the box with the mask as alpha → PNG. */
 async function cutoutPng(src: ImageData, d: MaskedDetection): Promise<Blob> {
@@ -180,16 +221,16 @@ async function cutoutPng(src: ImageData, d: MaskedDetection): Promise<Blob> {
   return c.convertToBlob({ type: "image/png" });
 }
 
-/** Plain rectangular crop (a little padding) for OCR — text near mask edges survives. */
-async function rectCrop(src: ImageData, d: MaskedDetection): Promise<Blob> {
+/** Plain rectangular crop with a little padding, so letters at the mask edge survive OCR. */
+function rectCrop(src: ImageData, d: MaskedDetection) {
   const pad = Math.round(Math.max(d.box.w, d.box.h) * 0.03);
   const x = Math.max(0, d.box.x - pad);
   const y = Math.max(0, d.box.y - pad);
   const w = Math.min(src.width - x, d.box.w + pad * 2);
   const h = Math.min(src.height - y, d.box.h + pad * 2);
-  const c = new OffscreenCanvas(w, h);
-  c.getContext("2d")!.putImageData(src, -x, -y, x, y, w, h);
-  return c.convertToBlob({ type: "image/jpeg", quality: 0.92 });
+  const canvas = new OffscreenCanvas(w, h);
+  canvas.getContext("2d", { willReadFrequently: true })!.putImageData(src, -x, -y, x, y, w, h);
+  return { canvas, offsetX: d.box.x - x, offsetY: d.box.y - y };
 }
 
 /** Downscaled photo with each mask tinted, for the results header. */
@@ -219,7 +260,7 @@ async function overlay(src: ImageData, dets: MaskedDetection[]): Promise<Blob> {
   return c.convertToBlob({ type: "image/jpeg", quality: 0.85 });
 }
 
-export function hue(i: number): [number, number, number] {
+function hue(i: number): [number, number, number] {
   const h = (i * 137.508) % 360;
   const f = (n: number) => {
     const k = (n + h / 30) % 12;

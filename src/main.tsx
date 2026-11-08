@@ -10,7 +10,6 @@ const MODEL_PATH = "models/yoloe-26s-seg.onnx";
 const LABELS_PATH = "models/labels.json";
 
 type Item = CutoutResult & {
-  id: string;
   url: string;
   lines: TextLine[];
   text: TextSummary;
@@ -33,38 +32,72 @@ function App() {
   const [backend, setBackend] = useState("");
   const [items, setItems] = useState<Item[]>([]);
   const [preview, setPreview] = useState<string | null>(null);
-  const [minScore, setMinScore] = useState(0.25);
+  const [minScore, setMinScore] = useState(0.3);
   const [ocrOn, setOcrOn] = useState(true);
   const [camera, setCamera] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const runId = useRef(0);
-  const ocrCache = useRef(new Map<string, TextLine[]>());
+  const currentRun = useRef(-1);
+  // Edits survive a re-decode (threshold change) when the same object comes back.
+  const keep = useRef(new Map<string, Pick<Item, "name" | "edited" | "include" | "lines" | "text" | "ocr">>());
 
   useEffect(() => {
     worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
       const m = e.data;
-      if (m.type === "progress") {
-        setProgress(m.total ? m.loaded / m.total : null);
-        setStatus(`Downloading object model… ${(m.loaded / 1e6).toFixed(0)} MB${m.total ? ` of ${(m.total / 1e6).toFixed(0)}` : ""}`);
-      } else if (m.type === "status") setStatus(m.text);
-      else if (m.type === "ready") {
-        setBackend(m.backend);
-        setProgress(null);
-        setPhase((p) => (p === "loading" ? "idle" : p));
-        setStatus("");
-        void takeShared();
-      } else if (m.type === "result") onResult(m.cutouts, m.preview);
-      else if (m.type === "error") {
-        setPhase("error");
-        setStatus(m.message);
+      switch (m.type) {
+        case "progress":
+          setProgress(m.total ? m.loaded / m.total : null);
+          setStatus(`Downloading object model… ${mb(m.loaded)}${m.total ? ` of ${mb(m.total)}` : ""}`);
+          break;
+        case "status":
+          setStatus(m.text);
+          break;
+        case "ready":
+          setBackend(m.backend);
+          setProgress(null);
+          setPhase((p) => (p === "loading" ? "idle" : p));
+          setStatus("");
+          void takeShared();
+          break;
+        case "result":
+          currentRun.current = m.run;
+          onResult(m.cutouts, m.preview);
+          break;
+        case "text":
+          if (m.run !== currentRun.current) return;
+          setItems((cur) =>
+            rename(cur.map((c) => (c.key === m.key ? { ...c, lines: m.lines, text: summarizeText(m.lines), ocr: "done" } : c))),
+          );
+          break;
+        case "text-done":
+          if (m.run !== currentRun.current) return;
+          setItems((cur) => cur.map((c) => (c.ocr === "pending" ? { ...c, ocr: "off" } : c)));
+          setStatus(m.error ? `Text reader unavailable: ${m.error}` : "");
+          break;
+        case "error":
+          setPhase("error");
+          setStatus(m.message);
+          break;
       }
     };
-    send({ type: "init", appBase, modelPath: MODEL_PATH, labelsPath: LABELS_PATH });
-    // Service workers only register on https or localhost; skip in dev so Vite's HMR isn't cached.
+    // ?backend=wasm (or webgpu) forces a runtime, useful if a GPU driver misbehaves.
+    const forced = new URLSearchParams(location.search).get("backend");
+    send({
+      type: "init",
+      appBase,
+      modelPath: MODEL_PATH,
+      labelsPath: LABELS_PATH,
+      backend: forced === "wasm" || forced === "webgpu" ? forced : undefined,
+    });
+    // Not in dev, so Vite's hot reload isn't cached.
     if ("serviceWorker" in navigator && !import.meta.env.DEV) {
       navigator.serviceWorker.register("./sw.js").catch(() => {});
     }
   }, []);
+
+  // Remember per-object state so a threshold change doesn't lose edits or text.
+  useEffect(() => {
+    for (const it of items) keep.current.set(it.key, it);
+  }, [items]);
 
   // Paste an image from the clipboard anywhere on the page.
   useEffect(() => {
@@ -88,91 +121,45 @@ function App() {
   async function analyze(file: Blob) {
     if (phase === "loading") return;
     setCamera(false);
-    runId.current++;
-    ocrCache.current.clear();
-    items.forEach((i) => URL.revokeObjectURL(i.url));
-    setItems([]);
-    if (preview) URL.revokeObjectURL(preview);
-    setPreview(URL.createObjectURL(file));
+    keep.current.clear();
+    setItems((old) => (old.forEach((i) => URL.revokeObjectURL(i.url)), []));
+    setPreview((old) => (old && URL.revokeObjectURL(old), URL.createObjectURL(file)));
     setPhase("working");
     setStatus("Reading photo…");
-    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
-    send({ type: "analyze", bitmap, minScore, ignore: IGNORE_TAGS }, [bitmap]);
+    try {
+      const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+      send({ type: "analyze", bitmap, minScore, ignore: IGNORE_TAGS, ocr: ocrOn }, [bitmap]);
+    } catch {
+      setPhase("error");
+      setStatus("Couldn't read that image. (HEIC photos may need converting to JPEG first.)");
+    }
   }
 
   function redecode(score: number) {
     setMinScore(score);
-    if (phase === "done") {
-      runId.current++;
-      send({ type: "redecode", minScore: score, ignore: IGNORE_TAGS });
-    }
+    if (phase === "done") send({ type: "redecode", minScore: score, ignore: IGNORE_TAGS, ocr: ocrOn });
   }
 
   function onResult(cutouts: CutoutResult[], previewBlob: Blob) {
-    const run = runId.current;
-    setPreview((old) => {
-      if (old) URL.revokeObjectURL(old);
-      return URL.createObjectURL(previewBlob);
-    });
+    setPreview((old) => (old && URL.revokeObjectURL(old), URL.createObjectURL(previewBlob)));
     const next: Item[] = cutouts
-      .map((c, i) => {
-        const key = `${c.label}@${c.box.x},${c.box.y},${c.box.w},${c.box.h}`;
-        const cached = ocrCache.current.get(key);
+      .map((c) => {
+        const prev = keep.current.get(c.key);
         return {
           ...c,
-          id: key + "#" + i,
           url: URL.createObjectURL(c.png),
-          lines: cached ?? [],
-          text: cached ? summarizeText(cached) : ({ kind: "none" } as TextSummary),
-          ocr: (ocrOn ? (cached ? "done" : "pending") : "off") as Item["ocr"],
-          name: "",
-          edited: false,
-          include: true,
-        };
+          lines: prev?.lines ?? [],
+          text: prev?.text ?? ({ kind: "none" } as TextSummary),
+          ocr: prev?.ocr === "done" ? "done" : ocrOn ? "pending" : "off",
+          name: prev?.name ?? "",
+          edited: prev?.edited ?? false,
+          include: prev?.include ?? true,
+        } as Item;
       })
       .sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
-    setItems((old) => {
-      old.forEach((i) => URL.revokeObjectURL(i.url));
-      return rename(next);
-    });
+    setItems((old) => (old.forEach((i) => URL.revokeObjectURL(i.url)), rename(next)));
     setPhase("done");
-    setStatus(cutouts.length ? "" : "No objects found — try lowering the confidence threshold.");
-    if (ocrOn) void runOcr(next, run);
-  }
-
-  async function runOcr(list: Item[], run: number) {
-    const todo = list.filter((i) => i.ocr === "pending");
-    if (!todo.length) return;
-    setStatus("Loading text reader…");
-    // Lazy: the OCR SDK bundles OpenCV (~10 MB), so only fetch it when needed.
-    const { loadOcr, readCutoutText } = await import("./pipeline/ocr.ts");
-    let ocr;
-    try {
-      ocr = await loadOcr(appBase);
-    } catch (err) {
-      setStatus(`Text reader unavailable: ${err instanceof Error ? err.message : err}`);
-      setItems((cur) => cur.map((i) => ({ ...i, ocr: "off" })));
-      return;
-    }
-    // Small objects first: they finish fast and are where short names come from.
-    const order = [...todo].sort((a, b) => a.box.w * a.box.h - b.box.w * b.box.h);
-    let n = 0;
-    for (const it of order) {
-      if (run !== runId.current) return;
-      setStatus(`Reading text ${++n}/${order.length}…`);
-      let lines: TextLine[] = [];
-      try {
-        lines = await readCutoutText(ocr, it);
-      } catch {
-        /* one bad crop shouldn't stop the rest */
-      }
-      ocrCache.current.set(it.id.split("#")[0], lines);
-      if (run !== runId.current) return;
-      setItems((cur) =>
-        rename(cur.map((c) => (c.id === it.id ? { ...c, lines, text: summarizeText(lines), ocr: "done" } : c))),
-      );
-    }
-    setStatus("");
+    setStatus(cutouts.length ? "" : "No objects found. Try lowering the confidence in Settings.");
   }
 
   const included = items.filter((i) => i.include);
@@ -199,15 +186,12 @@ function App() {
       files.push(new File([it.png], `${it.name}.png`, { type: "image/png" }));
       if (it.text.kind === "long") files.push(new File([it.text.text], `${it.name}.txt`, { type: "text/plain" }));
     }
-    if (navigator.canShare?.({ files })) {
-      await navigator.share({ files }).catch(() => {});
-    } else {
-      await downloadZip();
-    }
+    if (navigator.canShare?.({ files })) await navigator.share({ files }).catch(() => {});
+    else await downloadZip();
   }
 
   const busy = phase === "loading" || phase === "working";
-  const canShareFiles = typeof navigator.canShare === "function";
+  const reading = items.some((i) => i.ocr === "pending");
 
   return (
     <main
@@ -268,7 +252,7 @@ function App() {
 
       {(status || progress !== null) && (
         <div class={"status" + (phase === "error" ? " error" : "")}>
-          {busy && <span class="spinner" />}
+          {(busy || reading) && <span class="spinner" />}
           <span>{status}</span>
           {progress !== null && progress > 0 && <progress value={progress} />}
         </div>
@@ -282,7 +266,7 @@ function App() {
           {counts.length > 0 && (
             <figcaption>
               {counts.map(([label, n]) => (
-                <span class="chip">
+                <span class="chip" key={label}>
                   {label}
                   {n > 1 && <b> ×{n}</b>}
                 </span>
@@ -301,7 +285,7 @@ function App() {
             <button onClick={() => setItems(items.map((i) => ({ ...i, include: included.length !== items.length })))}>
               {included.length === items.length ? "Select none" : "Select all"}
             </button>
-            {canShareFiles && (
+            {typeof navigator.canShare === "function" && (
               <button disabled={!included.length} onClick={share}>
                 Share
               </button>
@@ -313,18 +297,18 @@ function App() {
 
           <section class="grid">
             {items.map((it) => (
-              <article class={"card" + (it.include ? "" : " off")} key={it.id}>
-                <div class="thumb" onClick={() => toggle(it.id)}>
+              <article class={"card" + (it.include ? "" : " off")} key={it.key}>
+                <div class="thumb" onClick={() => toggle(it.key)}>
                   <img src={it.url} alt={it.label} loading="lazy" />
-                  <input type="checkbox" checked={it.include} onClick={(e) => e.stopPropagation()} onChange={() => toggle(it.id)} />
+                  <input
+                    type="checkbox"
+                    checked={it.include}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => toggle(it.key)}
+                  />
                 </div>
                 <div class="meta">
-                  <input
-                    class="name"
-                    value={it.name}
-                    aria-label="File name"
-                    onChange={(e) => editName(it.id, e.currentTarget.value)}
-                  />
+                  <input class="name" value={it.name} aria-label="File name" onChange={(e) => editName(it.key, e.currentTarget.value)} />
                   <span class="ext">.png{it.text.kind === "long" && " + .txt"}</span>
                   <div class="facts">
                     <span>{it.label}</span>
@@ -334,7 +318,7 @@ function App() {
                     </span>
                   </div>
                   {it.ocr === "pending" && <div class="text muted">reading text…</div>}
-                  {it.text.kind !== "none" && (
+                  {textOf(it) && (
                     <div class="text" title={textOf(it)}>
                       “{textOf(it).length > 120 ? textOf(it).slice(0, 120) + "…" : textOf(it)}”
                     </div>
@@ -358,16 +342,17 @@ function App() {
     </main>
   );
 
-  function toggle(id: string) {
-    setItems(items.map((i) => (i.id === id ? { ...i, include: !i.include } : i)));
+  function toggle(key: string) {
+    setItems(items.map((i) => (i.key === key ? { ...i, include: !i.include } : i)));
   }
-  function editName(id: string, raw: string) {
+  function editName(key: string, raw: string) {
     const name = raw.replace(/[\\/:*?"<>|]+/g, "-").trim() || "object";
-    setItems(items.map((i) => (i.id === id ? { ...i, name, edited: true } : i)));
+    setItems(items.map((i) => (i.key === key ? { ...i, name, edited: true } : i)));
   }
 }
 
 const textOf = (it: Item) => (it.text.kind === "none" ? "" : it.text.text);
+const mb = (n: number) => `${(n / 1e6).toFixed(0)} MB`;
 
 /** Recompute automatic names (manually edited names are left alone). */
 function rename(list: Item[]): Item[] {
@@ -411,8 +396,7 @@ function Camera({ onCapture, onClose }: { onCapture: (b: Blob) => void; onClose:
     const IC = (window as any).ImageCapture;
     if (track && IC) {
       try {
-        const blob: Blob = await new IC(track).takePhoto();
-        return onCapture(blob);
+        return onCapture(await new IC(track).takePhoto());
       } catch {
         /* fall back to a video frame */
       }

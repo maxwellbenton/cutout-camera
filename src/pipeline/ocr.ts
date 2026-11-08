@@ -1,70 +1,73 @@
-// Text reading for cutouts, using PaddleOCR's browser SDK (PP-OCRv6, English).
-// Models download from PaddleOCR's CDN on first use; the service worker caches them.
-import { PaddleOCR } from "@paddleocr/paddleocr-js";
-import type { CutoutResult } from "./messages.ts";
+// Text reading for cutouts with PP-OCRv5 (English) via ppu-paddle-ocr.
+// Runs inside the detection worker. Models are self-hosted under
+// public/models/ocr so the PWA works offline once cached (~13 MB).
+import { PaddleOcrService } from "ppu-paddle-ocr/web";
 import type { TextLine } from "./naming.ts";
 
-type Ocr = Awaited<ReturnType<typeof PaddleOCR.create>>;
-let ocrPromise: Promise<Ocr> | null = null;
+let service: PaddleOcrService | null = null;
+let loading: Promise<PaddleOcrService> | null = null;
 
-export function loadOcr(appBase: string): Promise<Ocr> {
-  ocrPromise ??= PaddleOCR.create({
-    lang: "en",
-    ocrVersion: "PP-OCRv6",
-    worker: true,
-    ortOptions: { backend: "auto", wasmPaths: new URL("ort/", appBase).href },
-  }).catch((err) => {
-    ocrPromise = null;
+export function loadOcr(appBase: string, executionProviders: string[]): Promise<PaddleOcrService> {
+  if (service) return Promise.resolve(service);
+  loading ??= (async () => {
+    const base = new URL("models/ocr/", appBase).href;
+    const s = new PaddleOcrService({
+      model: {
+        detection: base + "PP-OCRv5_mobile_det_infer.ort",
+        recognition: base + "en_PP-OCRv5_mobile_rec_infer.ort",
+        charactersDictionary: base + "ppocrv5_en_dict.txt",
+      },
+      session: { executionProviders },
+    });
+    await s.initialize();
+    service = s;
+    return s;
+  })().catch((err) => {
+    loading = null;
     throw err;
   });
-  return ocrPromise!;
+  return loading;
 }
 
-const MIN_LINE_SCORE = 0.6;
-const MIN_CROP_SIDE = 24;
+export const MIN_LINE_CONFIDENCE = 0.6;
+export const MIN_CROP_SIDE = 24;
 
 /**
- * Read text on one cutout. OCR runs on a plain rectangular crop (so letters at
- * the mask edge aren't clipped), then lines are kept only if they sit on the
- * object's mask — text on whatever is behind the object is dropped.
+ * OCR one rectangular crop. `offsetX/Y` is where the cutout's box starts inside
+ * the crop; returned line boxes are relative to the cutout box. Lines whose
+ * centre isn't on the object's mask are dropped (that's text on whatever is
+ * behind the object).
  */
-export async function readCutoutText(ocr: Ocr, cut: CutoutResult): Promise<TextLine[]> {
-  if (Math.min(cut.box.w, cut.box.h) < MIN_CROP_SIDE) return [];
-  const bmp = await createImageBitmap(cut.crop);
-  // rectCrop() padded the box; recover the crop's origin in source coords.
-  const padX = Math.round((bmp.width - cut.box.w) / 2);
-  const padY = Math.round((bmp.height - cut.box.h) / 2);
-  bmp.close();
-
-  const [result] = await ocr.predict(cut.crop);
+export async function readText(
+  ocr: PaddleOcrService,
+  crop: OffscreenCanvas,
+  offsetX: number,
+  offsetY: number,
+  alpha: Uint8ClampedArray,
+  boxW: number,
+  boxH: number,
+): Promise<TextLine[]> {
+  const result = await ocr.recognize(crop as any, { flatten: true });
   const lines: TextLine[] = [];
-  for (const item of result?.items ?? []) {
-    if (item.score < MIN_LINE_SCORE || !item.text.trim()) continue;
-    const xs = item.poly.map((p) => p[0] - padX);
-    const ys = item.poly.map((p) => p[1] - padY);
-    const box = {
-      x: Math.min(...xs),
-      y: Math.min(...ys),
-      w: Math.max(...xs) - Math.min(...xs),
-      h: Math.max(...ys) - Math.min(...ys),
-    };
-    if (onMask(cut, box.x + box.w / 2, box.y + box.h / 2, Math.max(4, box.h / 2))) {
-      lines.push({ text: item.text, score: item.score, box });
+  for (const r of result.results) {
+    if (r.confidence < MIN_LINE_CONFIDENCE || !r.text.trim()) continue;
+    const box = { x: r.box.x - offsetX, y: r.box.y - offsetY, w: r.box.width, h: r.box.height };
+    if (onMask(alpha, boxW, boxH, box.x + box.w / 2, box.y + box.h / 2, Math.max(4, box.h / 2))) {
+      lines.push({ text: r.text.trim(), score: r.confidence, box });
     }
   }
   return lines;
 }
 
-/** Is there mask coverage near (x, y) in box-local coords? */
-function onMask(cut: CutoutResult, x: number, y: number, r: number): boolean {
-  const { w, h } = cut.box;
+/** Is there mask coverage within r px of (x, y)? Coordinates are box-local. */
+export function onMask(alpha: Uint8ClampedArray, w: number, h: number, x: number, y: number, r: number): boolean {
   const step = Math.max(1, Math.floor(r / 3));
   for (let dy = -r; dy <= r; dy += step) {
     for (let dx = -r; dx <= r; dx += step) {
       const px = Math.round(x + dx);
       const py = Math.round(y + dy);
       if (px < 0 || py < 0 || px >= w || py >= h) continue;
-      if (cut.alpha[py * w + px] > 96) return true;
+      if (alpha[py * w + px] > 96) return true;
     }
   }
   return false;

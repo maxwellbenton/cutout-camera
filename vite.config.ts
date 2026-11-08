@@ -8,7 +8,7 @@ export default defineConfig({
   worker: { format: "es" },
   optimizeDeps: {
     // ORT and the OCR SDK ship their own wasm/worker loaders; don't pre-bundle them.
-    exclude: ["onnxruntime-web", "@paddleocr/paddleocr-js"],
+    exclude: ["onnxruntime-web", "ppu-paddle-ocr"],
   },
   build: {
     target: "es2022",

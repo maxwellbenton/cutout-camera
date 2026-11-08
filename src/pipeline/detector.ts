@@ -77,7 +77,7 @@ export type DecodeOptions = {
 };
 
 export const defaultDecodeOptions: DecodeOptions = {
-  minScore: 0.25,
+  minScore: 0.3,
   dupIou: 0.85,
   minAreaFrac: 0.0004,
   ignore: new Set(),

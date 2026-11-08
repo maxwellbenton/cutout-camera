@@ -9,9 +9,9 @@
     "test:node": "node scripts/node-check.mjs"
   },
   "dependencies": {
-    "@paddleocr/paddleocr-js": "^0.4.2",
     "fflate": "^0.8.3",
     "onnxruntime-web": "^1.31.1",
+    "ppu-paddle-ocr": "^6.6.1",
     "preact": "^11.2.0"
   },
   "devDependencies": {
